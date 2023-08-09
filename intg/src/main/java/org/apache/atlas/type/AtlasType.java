@@ -26,6 +26,7 @@ import org.apache.atlas.utils.AtlasJson;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.Serializable;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -35,7 +36,7 @@ import java.util.Objects;
  * base class that declares interface for all Atlas types.
  */
 
-public abstract class AtlasType {
+public abstract class AtlasType implements Serializable {
     private static final Logger LOG = LoggerFactory.getLogger(AtlasType.class);
 
 

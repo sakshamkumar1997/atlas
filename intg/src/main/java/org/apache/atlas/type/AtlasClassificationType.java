@@ -32,12 +32,13 @@ import org.apache.commons.collections.CollectionUtils;
 import org.apache.commons.lang.StringUtils;
 import org.apache.commons.validator.routines.DateValidator;
 
+import java.io.Serializable;
 import java.util.*;
 
 /**
  * class that implements behaviour of a classification-type.
  */
-public class AtlasClassificationType extends AtlasStructType {
+public class AtlasClassificationType extends AtlasStructType implements Serializable {
 
     public  static final AtlasClassificationType CLASSIFICATION_ROOT      = initRootClassificationType();
     private static final String                  CLASSIFICATION_ROOT_NAME = "__CLASSIFICATION_ROOT";

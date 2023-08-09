@@ -33,8 +33,11 @@ import org.apache.commons.lang.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
+import redis.clients.jedis.Jedis;
+import redis.clients.jedis.JedisPool;
 
 import javax.inject.Singleton;
+import java.io.*;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -49,6 +52,7 @@ import static org.apache.atlas.model.typedef.AtlasBaseTypeDef.*;
 public class AtlasTypeRegistry {
     private static final Logger LOG = LoggerFactory.getLogger(AtlasTypeRegistry.class);
     private static final int    DEFAULT_LOCK_MAX_WAIT_TIME_IN_SECONDS = 15;
+    private static final String ATLAS_REDIS_TYPE_DEF_CACHE = "atlas_redis_tdc";
 
     protected       RegistryData                   registryData;
     private   final TypeRegistryUpdateSynchronizer updateSynchronizer;
@@ -56,7 +60,8 @@ public class AtlasTypeRegistry {
     private   final Map<String, String>            commonIndexFieldNameCache;
 
     public AtlasTypeRegistry() {
-        registryData              = new RegistryData();
+        LOG.info("Using the new atlas type registry");
+        registryData              = new RegistryData(true);
         updateSynchronizer        = new TypeRegistryUpdateSynchronizer(this);
         missingRelationshipDefs   = new HashSet<>();
         commonIndexFieldNameCache = new LinkedHashMap<>();
@@ -67,7 +72,8 @@ public class AtlasTypeRegistry {
 
     // used only by AtlasTransientTypeRegistry
     protected AtlasTypeRegistry(AtlasTypeRegistry other) {
-        registryData              = new RegistryData();
+        LOG.info("Using the new transient atlas type registry");
+        registryData              = new RegistryData(false);
         updateSynchronizer        = other.updateSynchronizer;
         missingRelationshipDefs   = other.missingRelationshipDefs;
         commonIndexFieldNameCache = other.commonIndexFieldNameCache;
@@ -312,8 +318,8 @@ public class AtlasTypeRegistry {
         final TypeDefCache<AtlasBusinessMetadataDef, AtlasBusinessMetadataType> businessMetadataDefs;
         final TypeDefCache<? extends AtlasBaseTypeDef, ? extends AtlasType>[]   allDefCaches;
 
-        RegistryData() {
-            allTypes             = new TypeCache();
+        RegistryData(boolean persistInAtlas) {
+            allTypes             = new TypeCache(persistInAtlas);
             enumDefs             = new TypeDefCache<>(allTypes);
             structDefs           = new TypeDefCache<>(allTypes);
             classificationDefs   = new TypeDefCache<>(allTypes);
@@ -998,7 +1004,12 @@ public class AtlasTypeRegistry {
                             copyIndexNameFromCurrent(ttr.getAllEntityTypes());
                             copyIndexNameFromCurrent(ttr.getAllBusinessMetadataTypes());
 
+                            typeRegistry.updateRedis(ttr.registryData);
                             typeRegistry.registryData = ttr.registryData;
+                            typeRegistry.registryData.allTypes.removeTypeByName("string");
+                            typeRegistry.registryData.allTypes.persistInRedis = true;
+//                            AtlasType string = typeRegistry.registryData.allTypes.getTypeByName("string");
+
                         }
                     }
 
@@ -1048,29 +1059,99 @@ public class AtlasTypeRegistry {
 
         }
     }
+
+    private void updateRedis(RegistryData transientRegistryData) {
+        TypeCache tc = transientRegistryData.allTypes;
+        for(AtlasType type : tc.getAllTypes()) {
+            this.registryData.allTypes.addType(type);
+        }
+
+        Map<String, AtlasType> guidMap = tc.getGuidMap();
+        for(String key : guidMap.keySet()) {
+            this.registryData.allTypes.addType(key, guidMap.get(key));
+        }
+    }
 }
 
 class TypeCache {
     private final Map<String, AtlasType> typeGuidMap;
     private final Map<String, AtlasType> typeNameMap;
     private final Set<String>            serviceTypes;
+    JedisPool pool;
+    boolean persistInRedis;
 
-    public TypeCache() {
+    private static final Logger LOG = LoggerFactory.getLogger(TypeCache.class);
+    private static final String ATLAS_REDIS_TYPE_CACHE = "atlas_redis_tc_";
+    private static final String ATLAS_REDIS_TYPE_CACHE_NAME = ATLAS_REDIS_TYPE_CACHE + "name_";
+    private static final String ATLAS_REDIS_TYPE_CACHE_GUID = ATLAS_REDIS_TYPE_CACHE + "guid_";
+
+    public TypeCache(boolean persistInRedis) {
         typeGuidMap  = new ConcurrentHashMap<>();
         typeNameMap  = new ConcurrentHashMap<>();
         serviceTypes = new HashSet<>();
+        pool = new JedisPool("localhost", 6379);
+        this.persistInRedis = persistInRedis;
     }
 
     public TypeCache(TypeCache other) {
         typeGuidMap  = new ConcurrentHashMap<>(other.typeGuidMap);
         typeNameMap  = new ConcurrentHashMap<>(other.typeNameMap);
         serviceTypes = new HashSet<>(other.serviceTypes);
+        this.pool = other.pool;
+    }
+
+    public Map<String, AtlasType> getGuidMap() {
+        return Collections.unmodifiableMap(typeGuidMap);
+    }
+
+    public void addType(String guid, AtlasType type) {
+        if (guid != null && type != null) {
+            if (StringUtils.isNotEmpty(guid)) {
+                if (!persistInRedis)
+                    typeGuidMap.put(guid, type);
+                else {
+                    try (Jedis jedis = pool.getResource()) {
+                        if (type.getTypeName().equalsIgnoreCase(AtlasBaseTypeDef.ATLAS_TYPE_STRING) || type.getTypeCategory().name().equalsIgnoreCase("CLASSIFICATION")) {
+                            try {
+                                ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                                ObjectOutputStream oos = new ObjectOutputStream(baos);
+                                oos.writeObject(type);
+                                oos.close();
+                                jedis.set(ATLAS_REDIS_TYPE_CACHE_GUID + guid, Base64.getEncoder().encodeToString(baos.toByteArray()));
+
+                            } catch (IOException e) {
+
+                            }
+                        } else {
+                            typeGuidMap.put(guid, type);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     public void addType(AtlasType type) {
         if (type != null) {
             if (StringUtils.isNotEmpty(type.getTypeName())) {
-                typeNameMap.put(type.getTypeName(), type);
+                if(!persistInRedis)
+                    typeNameMap.put(type.getTypeName(), type);
+                else {
+                    try (Jedis jedis = pool.getResource()) {
+                        if(type.getTypeName().equalsIgnoreCase(AtlasBaseTypeDef.ATLAS_TYPE_STRING) || type.getTypeCategory().name().equalsIgnoreCase("CLASSIFICATION")) {
+                            try {
+                                ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                                ObjectOutputStream oos = new ObjectOutputStream( baos );
+                                oos.writeObject(type);
+                                oos.close();
+                                jedis.set(ATLAS_REDIS_TYPE_CACHE_NAME + type.getTypeName(), Base64.getEncoder().encodeToString(baos.toByteArray()));
+
+                            } catch (IOException e) {
+
+                            }
+                        } else {typeNameMap.put(type.getTypeName(), type);}
+                    }
+                }
             }
 
             if (StringUtils.isNotEmpty(type.getServiceType())) {
@@ -1082,11 +1163,49 @@ class TypeCache {
     public void addType(AtlasBaseTypeDef typeDef, AtlasType type) {
         if (typeDef != null && type != null) {
             if (StringUtils.isNotEmpty(typeDef.getGuid())) {
-                typeGuidMap.put(typeDef.getGuid(), type);
+                if(!persistInRedis)
+                    typeGuidMap.put(typeDef.getGuid(), type);
+                else  {
+                    try (Jedis jedis = pool.getResource()) {
+                        if(type.getTypeName().equalsIgnoreCase(AtlasBaseTypeDef.ATLAS_TYPE_STRING) || type.getTypeCategory().name().equalsIgnoreCase("CLASSIFICATION")) {
+                            try {
+                                ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                                ObjectOutputStream oos = new ObjectOutputStream( baos );
+                                oos.writeObject(type);
+                                oos.close();
+                                jedis.set(ATLAS_REDIS_TYPE_CACHE_GUID + typeDef.getGuid(), Base64.getEncoder().encodeToString(baos.toByteArray()));
+
+                            } catch (IOException e) {
+
+                            }
+                        } else {
+                            typeGuidMap.put(typeDef.getGuid(), type);
+                        }
+                    }
+                }
             }
 
             if (StringUtils.isNotEmpty(typeDef.getName())) {
-                typeNameMap.put(typeDef.getName(), type);
+                if(!persistInRedis)
+                    typeNameMap.put(typeDef.getName(), type);
+                else  {
+                    try (Jedis jedis = pool.getResource()) {
+                        if(type.getTypeName().equalsIgnoreCase(AtlasBaseTypeDef.ATLAS_TYPE_STRING) || type.getTypeCategory().name().equalsIgnoreCase("CLASSIFICATION")) {
+                            try {
+                                ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                                ObjectOutputStream oos = new ObjectOutputStream( baos );
+                                oos.writeObject(type);
+                                oos.close();
+                                jedis.set(ATLAS_REDIS_TYPE_CACHE_NAME + type.getTypeName(), Base64.getEncoder().encodeToString(baos.toByteArray()));
+
+                            } catch (IOException e) {
+
+                            }
+                        } else {
+                            typeNameMap.put(typeDef.getName(), type);
+                        }
+                    }
+                }
             }
 
             if (StringUtils.isNotEmpty(type.getServiceType())) {
@@ -1096,15 +1215,48 @@ class TypeCache {
     }
 
     public boolean isKnownType(String typeName) {
+        try (Jedis jedis = pool.getResource()) {
+            if (persistInRedis && jedis.exists(ATLAS_REDIS_TYPE_CACHE_NAME + typeName)) {
+                LOG.info("in isKnownType : Key in redis for typename : " + typeName + " is : " + jedis.exists(ATLAS_REDIS_TYPE_CACHE_NAME + typeName));
+                return jedis.exists(ATLAS_REDIS_TYPE_CACHE_NAME + typeName);
+            }
+        }
         return typeNameMap.containsKey(typeName);
     }
 
     public Collection<String> getAllTypeNames() {
-        return Collections.unmodifiableCollection(typeNameMap.keySet());
+        Set<String> keySet = new HashSet<>();
+        keySet.addAll(typeNameMap.keySet());
+
+        if (persistInRedis) {
+            try (Jedis jedis = pool.getResource()) {
+                Set<String> keys = jedis.keys(ATLAS_REDIS_TYPE_CACHE_NAME + "*");
+                for(String key : keys) {
+                    keySet.add(key.split(ATLAS_REDIS_TYPE_CACHE_NAME)[1]);
+                }
+                LOG.info("Found all keys : " + keys);
+            }
+        }
+        return Collections.unmodifiableCollection(keySet);
     }
 
     public Collection<AtlasType> getAllTypes() {
-        return Collections.unmodifiableCollection(typeNameMap.values());
+        Set<AtlasType> valueSet = new HashSet<>(typeNameMap.values());
+        try (Jedis jedis = pool.getResource()) {
+            Set<String> keys = jedis.keys(ATLAS_REDIS_TYPE_CACHE_NAME + "*");
+            LOG.info("Found all keys : " + keys);
+            for(String key : keys) {
+                String desValue = jedis.get(key);
+                byte [] data = Base64.getDecoder().decode(desValue);
+                ObjectInputStream ois = new ObjectInputStream(new ByteArrayInputStream(data));
+                AtlasType o  = (AtlasType) ois.readObject();
+                valueSet.add(o);
+            }
+        } catch (IOException | ClassNotFoundException e) {
+            throw new RuntimeException(e);
+        }
+
+        return Collections.unmodifiableCollection(valueSet);
     }
 
     public Set<String> getAllServiceTypes() {
@@ -1112,44 +1264,117 @@ class TypeCache {
     }
 
     public AtlasType getTypeByGuid(String guid) {
-
-        return guid != null ? typeGuidMap.get(guid) : null;
+        LOG.info("checking type by guid : " + guid);
+        try (Jedis jedis = pool.getResource()) {
+            if(guid == null)
+                return null;
+            else if (typeNameMap.containsKey(guid) && !persistInRedis) {
+                return typeNameMap.get(guid);
+            } else {
+                if (jedis.exists(ATLAS_REDIS_TYPE_CACHE_GUID + guid)) {
+                    String desValue = jedis.get(ATLAS_REDIS_TYPE_CACHE_GUID + guid);
+                    byte [] data = Base64.getDecoder().decode(desValue);
+                    ObjectInputStream ois = new ObjectInputStream(new ByteArrayInputStream(data));
+                    return (AtlasType) ois.readObject();
+                } else {
+                    return typeNameMap.get(guid);
+                }
+            }
+        } catch (IOException | ClassNotFoundException e) {
+            throw new RuntimeException(e);
+        }
     }
 
     public AtlasType getTypeByName(String name) {
-
-        return name != null ? typeNameMap.get(name) : null;
+        LOG.info("checking type by name : " + name);
+        try (Jedis jedis = pool.getResource()) {
+            if(name == null)
+                return null;
+            else if (typeNameMap.containsKey(name) && !persistInRedis) {
+                return typeNameMap.get(name);
+            } else {
+                if (jedis.exists(ATLAS_REDIS_TYPE_CACHE_NAME + name)) {
+                    String desValue = jedis.get(ATLAS_REDIS_TYPE_CACHE_NAME + name);
+                    byte [] data = Base64.getDecoder().decode(desValue);
+                    ObjectInputStream ois = new ObjectInputStream(new ByteArrayInputStream(data));
+                    return (AtlasType) ois.readObject();
+                } else {
+                    return typeNameMap.get(name);
+                }
+            }
+        } catch (IOException | ClassNotFoundException e) {
+            throw new RuntimeException(e);
+        }
     }
 
     public void updateGuid(String typeName, String currGuid, String newGuid) {
         if (currGuid != null) {
-            typeGuidMap.remove(currGuid);
-        }
+            if(typeGuidMap.containsKey(currGuid)) {
+                typeGuidMap.remove(currGuid);
+                if (typeName != null && newGuid != null) {
+                    AtlasType type = typeNameMap.get(typeName);
+                    if (type != null) {
+                        typeGuidMap.put(newGuid, type);
+                    }
+                }
+            }
 
-        if (typeName != null && newGuid != null) {
-            AtlasType type = typeNameMap.get(typeName);
-
-            if (type != null) {
-                typeGuidMap.put(newGuid, type);
+            try (Jedis jedis = pool.getResource()) {
+                    if (persistInRedis && jedis.exists(ATLAS_REDIS_TYPE_CACHE_GUID + currGuid)) {
+                        jedis.del(ATLAS_REDIS_TYPE_CACHE_GUID + currGuid);
+                        if (typeName != null && newGuid != null) {
+                            String desValue = jedis.get(ATLAS_REDIS_TYPE_CACHE_NAME + typeName);
+                            byte[] data = Base64.getDecoder().decode(desValue);
+                            ObjectInputStream ois = new ObjectInputStream(new ByteArrayInputStream(data));
+                            AtlasType type = (AtlasType) ois.readObject();
+                            if (type != null) {
+                                jedis.set(newGuid, desValue);
+                            }
+                        }
+                    }
+            } catch (IOException | ClassNotFoundException e) {
+                throw new RuntimeException(e);
             }
         }
     }
 
     public void removeTypeByGuid(String guid) {
         if (guid != null) {
-            typeGuidMap.remove(guid);
+            if(typeGuidMap.containsKey(guid)) {
+                typeGuidMap.remove(guid);
+            }
+            if(persistInRedis) {
+                try (Jedis jedis = pool.getResource()) {
+                    jedis.del(ATLAS_REDIS_TYPE_CACHE_GUID + guid);
+                }
+            }
         }
     }
 
     public void removeTypeByName(String name) {
         if (name != null) {
-            typeNameMap.remove(name);
+            if (typeNameMap.containsKey(name)) {
+                typeNameMap.remove(name);
+            }
+            try (Jedis jedis = pool.getResource()) {
+                if (persistInRedis && jedis.exists(ATLAS_REDIS_TYPE_CACHE_NAME + name)) {
+                    jedis.del(ATLAS_REDIS_TYPE_CACHE_NAME + name);
+                }
+            }
         }
     }
 
     public void clear() {
         typeGuidMap.clear();
         typeNameMap.clear();
+        if (persistInRedis) {
+            try (Jedis jedis = pool.getResource()) {
+                Set<String> keys = jedis.keys(ATLAS_REDIS_TYPE_CACHE + "*");
+                for (String key : keys) {
+                    jedis.del(key);
+                }
+            }
+        }
     }
 }
 

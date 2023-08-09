@@ -33,6 +33,7 @@ import org.apache.commons.lang.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.Serializable;
 import java.util.*;
 
 import static org.apache.atlas.model.TypeCategory.OBJECT_ID_TYPE;
@@ -42,7 +43,7 @@ import static org.apache.atlas.model.typedef.AtlasStructDef.AtlasConstraintDef.*
 /**
  * class that implements behaviour of a struct-type.
  */
-public class AtlasStructType extends AtlasType {
+public class AtlasStructType extends AtlasType implements Serializable {
     private static final Logger LOG = LoggerFactory.getLogger(AtlasStructType.class);
 
     public static final String UNIQUE_ATTRIBUTE_SHADE_PROPERTY_PREFIX = "__u_";

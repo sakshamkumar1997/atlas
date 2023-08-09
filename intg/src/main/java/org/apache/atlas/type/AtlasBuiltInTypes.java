@@ -25,6 +25,7 @@ import org.apache.atlas.model.typedef.AtlasBaseTypeDef;
 import org.apache.commons.collections.MapUtils;
 import org.apache.commons.lang.StringUtils;
 
+import java.io.Serializable;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.text.ParseException;
@@ -681,7 +682,7 @@ public class AtlasBuiltInTypes {
     /**
      * class that implements behaviour of String type.
      */
-    public static class AtlasStringType extends AtlasType {
+    public static class AtlasStringType extends AtlasType implements Serializable {
         private static final String DEFAULT_VALUE = "";
         private static final String OPTIONAL_DEFAULT_VALUE = null;
 
