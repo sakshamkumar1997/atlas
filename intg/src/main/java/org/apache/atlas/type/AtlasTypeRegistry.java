@@ -19,6 +19,8 @@ package org.apache.atlas.type;
 
 import org.apache.atlas.AtlasErrorCode;
 import org.apache.atlas.exception.AtlasBaseException;
+import org.apache.atlas.model.TypeCategory;
+import org.apache.atlas.model.instance.AtlasClassification;
 import org.apache.atlas.model.typedef.AtlasBaseTypeDef;
 import org.apache.atlas.model.typedef.AtlasBusinessMetadataDef;
 import org.apache.atlas.model.typedef.AtlasClassificationDef;
@@ -1004,10 +1006,12 @@ public class AtlasTypeRegistry {
                             copyIndexNameFromCurrent(ttr.getAllEntityTypes());
                             copyIndexNameFromCurrent(ttr.getAllBusinessMetadataTypes());
 
-                            typeRegistry.updateRedis(ttr.registryData);
                             typeRegistry.registryData = ttr.registryData;
-                            typeRegistry.registryData.allTypes.removeTypeByName("string");
                             typeRegistry.registryData.allTypes.persistInRedis = true;
+                            typeRegistry.registryData.classificationDefs.persistInRedis = true;
+                            typeRegistry.updateRedis(ttr.registryData);
+                            typeRegistry.registryData.allTypes.removeTypeByName("string");
+
 //                            AtlasType string = typeRegistry.registryData.allTypes.getTypeByName("string");
 
                         }
@@ -1062,6 +1066,8 @@ public class AtlasTypeRegistry {
 
     private void updateRedis(RegistryData transientRegistryData) {
         TypeCache tc = transientRegistryData.allTypes;
+        TypeDefCache classificationTDC = transientRegistryData.classificationDefs;
+
         for(AtlasType type : tc.getAllTypes()) {
             this.registryData.allTypes.addType(type);
         }
@@ -1069,6 +1075,16 @@ public class AtlasTypeRegistry {
         Map<String, AtlasType> guidMap = tc.getGuidMap();
         for(String key : guidMap.keySet()) {
             this.registryData.allTypes.addType(key, guidMap.get(key));
+        }
+
+        Map<String, AtlasClassificationDef> typeDefGuidMap = classificationTDC.getTypeDefGuidMap();
+        Map<String, AtlasClassificationDef> typeDefNameMap = classificationTDC.getTypeDefNameMap();
+        Map<String, AtlasType> typeNameMap = classificationTDC.getTypeNameMap();
+
+        for(String key : typeDefNameMap.keySet()) {
+            AtlasClassificationDef typeDef = typeDefNameMap.get(key);
+            AtlasClassificationType type = (AtlasClassificationType) typeNameMap.get(key);
+            this.registryData.classificationDefs.addType(typeDef, type);
         }
     }
 }
@@ -1268,8 +1284,8 @@ class TypeCache {
         try (Jedis jedis = pool.getResource()) {
             if(guid == null)
                 return null;
-            else if (typeNameMap.containsKey(guid) && !persistInRedis) {
-                return typeNameMap.get(guid);
+            else if (typeGuidMap.containsKey(guid) && !persistInRedis) {
+                return typeGuidMap.get(guid);
             } else {
                 if (jedis.exists(ATLAS_REDIS_TYPE_CACHE_GUID + guid)) {
                     String desValue = jedis.get(ATLAS_REDIS_TYPE_CACHE_GUID + guid);
@@ -1277,7 +1293,7 @@ class TypeCache {
                     ObjectInputStream ois = new ObjectInputStream(new ByteArrayInputStream(data));
                     return (AtlasType) ois.readObject();
                 } else {
-                    return typeNameMap.get(guid);
+                    return typeGuidMap.get(guid);
                 }
             }
         } catch (IOException | ClassNotFoundException e) {
@@ -1385,33 +1401,91 @@ class TypeDefCache<T1 extends AtlasBaseTypeDef, T2 extends AtlasType> {
     private final Map<String, T1> typeDefGuidMap;
     private final Map<String, T1> typeDefNameMap;
     private final Map<String, T2> typeNameMap;
+    boolean persistInRedis;
+    JedisPool pool;
+    private static final String ATLAS_REDIS_TYPE_DEF_CACHE = "atlas_redis_tdc_";
+    private static final String ATLAS_REDIS_TYPE_DEF_CACHE_NAME = ATLAS_REDIS_TYPE_DEF_CACHE + "name_";
+    private static final String ATLAS_REDIS_TYPE_DEF_CACHE_GUID = ATLAS_REDIS_TYPE_DEF_CACHE + "guid_";
+    private static final String ATLAS_REDIS_TYPE_DEF_CACHE_NAME_TYPE = ATLAS_REDIS_TYPE_DEF_CACHE + "name_type_";
 
     public TypeDefCache(TypeCache typeCache) {
         this.typeCache      = typeCache;
+        this.persistInRedis = typeCache.persistInRedis;
         this.typeDefGuidMap = new ConcurrentHashMap<>();
         this.typeDefNameMap = new ConcurrentHashMap<>();
         this.typeNameMap    = new ConcurrentHashMap<>();
+        pool = new JedisPool("localhost", 6379);
+
     }
 
     public TypeDefCache(TypeDefCache other, TypeCache typeCache) {
         this.typeCache      = typeCache;
+        this.persistInRedis = typeCache.persistInRedis;
         this.typeDefGuidMap = new ConcurrentHashMap<>(other.typeDefGuidMap);
         this.typeDefNameMap = new ConcurrentHashMap<>(other.typeDefNameMap);
         this.typeNameMap    = new ConcurrentHashMap<>(other.typeNameMap);
+        pool = new JedisPool("localhost", 6379);
+
+    }
+
+    public Map<String, AtlasBaseTypeDef> getTypeDefGuidMap() {
+        return Collections.unmodifiableMap(this.typeDefGuidMap);
+    }
+
+    public Map<String, AtlasBaseTypeDef> getTypeDefNameMap() {
+        return Collections.unmodifiableMap(this.typeDefNameMap);
+    }
+
+    public Map<String, AtlasType> getTypeNameMap() {
+        return Collections.unmodifiableMap(this.typeNameMap);
     }
 
     public void addType(T1 typeDef, T2 type) {
         if (typeDef != null && type != null) {
-            if (StringUtils.isNotEmpty(typeDef.getGuid())) {
-                typeDefGuidMap.put(typeDef.getGuid(), typeDef);
-            }
+            if (persistInRedis && (typeDef.getCategory() == TypeCategory.CLASSIFICATION)) {
+                try (Jedis jedis = pool.getResource()) {
+                    if (StringUtils.isNotEmpty(typeDef.getGuid())) {
+                        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                        ObjectOutputStream oos = new ObjectOutputStream(baos);
+                        oos.writeObject(typeDef);
+                        oos.close();
+                        jedis.set(ATLAS_REDIS_TYPE_DEF_CACHE_GUID + typeDef.getGuid(), Base64.getEncoder().encodeToString(baos.toByteArray()));
+                    }
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
 
-            if (StringUtils.isNotEmpty(typeDef.getName())) {
-                typeDefNameMap.put(typeDef.getName(), typeDef);
-                typeNameMap.put(typeDef.getName(), type);
-            }
+                try (Jedis jedis = pool.getResource()) {
+                    if (StringUtils.isNotEmpty(typeDef.getName())) {
+                        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                        ObjectOutputStream oos = new ObjectOutputStream(baos);
+                        oos.writeObject(typeDef);
+                        oos.close();
+                        jedis.set(ATLAS_REDIS_TYPE_DEF_CACHE_NAME + typeDef.getName(), Base64.getEncoder().encodeToString(baos.toByteArray()));
+                        baos = new ByteArrayOutputStream();
+                        oos = new ObjectOutputStream(baos);
+                        oos.writeObject(type);
+                        oos.close();
+                        jedis.set(ATLAS_REDIS_TYPE_DEF_CACHE_NAME_TYPE + typeDef.getName(), Base64.getEncoder().encodeToString(baos.toByteArray()));
+//                        typeNameMap.put(typeDef.getName(), type);
+                    }
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
 
-            typeCache.addType(typeDef, type);
+                typeCache.addType(typeDef, type);
+            } else {
+                if (StringUtils.isNotEmpty(typeDef.getGuid())) {
+                    typeDefGuidMap.put(typeDef.getGuid(), typeDef);
+                }
+
+                if (StringUtils.isNotEmpty(typeDef.getName())) {
+                    typeDefNameMap.put(typeDef.getName(), typeDef);
+                    typeNameMap.put(typeDef.getName(), type);
+                }
+
+                typeCache.addType(typeDef, type);
+            }
         }
     }
 
@@ -1422,11 +1496,35 @@ class TypeDefCache<T1 extends AtlasBaseTypeDef, T2 extends AtlasType> {
     public Collection<String> getAllNames() { return Collections.unmodifiableCollection(typeDefNameMap.keySet()); }
 
     public T1 getTypeDefByGuid(String guid) {
-        return guid != null ? typeDefGuidMap.get(guid) : null;
+        if (guid == null) return null;
+        try(Jedis jedis = pool.getResource()) {
+            if(jedis.exists(ATLAS_REDIS_TYPE_DEF_CACHE_GUID + guid)) {
+                String desValue = jedis.get(ATLAS_REDIS_TYPE_DEF_CACHE_GUID + guid);
+                byte [] data = Base64.getDecoder().decode(desValue);
+                ObjectInputStream ois = new ObjectInputStream(new ByteArrayInputStream(data));
+                return (T1) ois.readObject();
+            } else {
+                return typeDefGuidMap.get(guid);
+            }
+        } catch (IOException | ClassNotFoundException e) {
+            throw new RuntimeException(e);
+        }
     }
 
     public T1 getTypeDefByName(String name) {
-        return name != null ? typeDefNameMap.get(name) : null;
+        if (name == null) return null;
+        try(Jedis jedis = pool.getResource()) {
+            if(jedis.exists(ATLAS_REDIS_TYPE_DEF_CACHE_NAME + name)) {
+                String desValue = jedis.get(ATLAS_REDIS_TYPE_DEF_CACHE_NAME + name);
+                byte [] data = Base64.getDecoder().decode(desValue);
+                ObjectInputStream ois = new ObjectInputStream(new ByteArrayInputStream(data));
+                return (T1) ois.readObject();
+            } else {
+                return typeDefNameMap.get(name);
+            }
+        } catch (IOException | ClassNotFoundException e) {
+            throw new RuntimeException(e);
+        }
     }
 
     public Collection<T2> getAllTypes() {
@@ -1434,7 +1532,19 @@ class TypeDefCache<T1 extends AtlasBaseTypeDef, T2 extends AtlasType> {
     }
 
     public T2 getTypeByName(String name) {
-        return name != null ? typeNameMap.get(name) : null;
+        if (name == null) return null;
+        try(Jedis jedis = pool.getResource()) {
+            if(jedis.exists(ATLAS_REDIS_TYPE_DEF_CACHE_NAME_TYPE + name)) {
+                String desValue = jedis.get(ATLAS_REDIS_TYPE_DEF_CACHE_NAME_TYPE + name);
+                byte [] data = Base64.getDecoder().decode(desValue);
+                ObjectInputStream ois = new ObjectInputStream(new ByteArrayInputStream(data));
+                return (T2) ois.readObject();
+            } else {
+                return typeNameMap.get(name);
+            }
+        } catch (IOException | ClassNotFoundException e) {
+            throw new RuntimeException(e);
+        }
     }
 
     public void updateGuid(String typeName, String newGuid) {
